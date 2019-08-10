@@ -7,6 +7,9 @@ require "net/http"
 require "stud/try"
 require "octokit"
 require "erb"
+require "pmap"
+
+require_relative 'lib/logstash-docket'
 
 class VersionedPluginDocs < Clamp::Command
   option "--output-path", "OUTPUT", "Path to a directory where logstash-docs repository will be cloned and written to", required: true
@@ -16,6 +19,9 @@ class VersionedPluginDocs < Clamp::Command
   option "--plugin-regex", "REGEX", "Only generate if plugin matches given regex", :default => "logstash-(?:codec|filter|input|output)"
   option "--dry-run", :flag, "Don't create a commit or pull request against logstash-docs", :default => false
   option "--test", :flag, "Clone docs repo and test generated docs", :default => false
+  option "--since", "STRING", "gems newer than this date", default: nil do |v|
+    v && Time.parse(v)
+  end
 
   PLUGIN_SKIP_LIST = [
     "logstash-codec-example",
@@ -38,6 +44,8 @@ class VersionedPluginDocs < Clamp::Command
   end
 
   attr_reader :octo
+
+  include LogstashDocket
 
   def execute
     setup_github_client
@@ -93,71 +101,65 @@ class VersionedPluginDocs < Clamp::Command
     repos = (repos - PLUGIN_SKIP_LIST).sort.uniq
 
     puts "found #{repos.size} repos"
-    repos_by_type = {}
-    repos.each do |repo|
-      _, type, name = repo.split("-",3)
-      repos_by_type[type] ||= []
-      repos_by_type[type] << repo
-    end
-    threads = repos_by_type.map do |type, repos|
-      Thread.new { process_repos(octo, type, repos) }
-    end
-    threads.each(&:join)
-  end
 
-  def process_repos(octo, type, repos)
-    repos_to_index = []
-    puts "Looking for tags since the day before the last logstash-docs commit: #{$TIMESTAMP_REFERENCE}"
+    # TODO: make less convoluted
+    timestamp_reference = since || Time.strptime($TIMESTAMP_REFERENCE, "%a, %d %b %Y %H:%M:%S %Z")
+    hard_cutoff = Time.parse("2017-05-10T00:00:00Z")
+
+    plugins_to_reindex = Util::ThreadsafeWrapper.for(Set.new)
+    packages_to_reindex = Util::ThreadsafeWrapper.for(Set.new)
+
+    plugin_version_index = Util::ThreadsafeIndex.new { Util::ThreadsafeWrapper.for(Set.new) }
+    plugin_names_by_type = Util::ThreadsafeIndex.new { Util::ThreadsafeWrapper.for(Set.new) }
+
     repos.each do |repo|
-      print "[#{repo}] looking for tags..."
-      # with this header we avoid consuming from the github's rate limit quota if there are no new tags
-      tags = octo.tags("logstash-plugins/#{repo}", :headers => { "If-Modified-Since" => $TIMESTAMP_REFERENCE})
-      if tags.empty?
-        puts "no new tags. skipping"
-        _, _, name = repo.split("-",3)
-        repos_to_index << name if versions_index_exists?(name, type)
-        next
-      else
-        puts "found new tags (in total: #{tags.size} tags)"
+      $stderr.puts("[#{repo}]: loading releases...")
+      repository = Repository::from_github("logstash-plugins", repo)
+
+      # add to the mapping of contained plugins
+      repository.versioned_packages.flat_map(&:plugins).each do |plugin|
+
+        next if plugin.release_date && plugin.release_date < hard_cutoff
+
+        plugin_version_index.for(plugin.canonical_name).add(plugin)
+        plugin_names_by_type.for(plugin.type).add(plugin.name)
       end
 
-      begin
-        release_info = fetch_release_info(repo)
-      rescue
-        puts "[#{repo}] failed to fetch data for #{repo}. skipping"
+      $stderr.puts("[#{repository.name}]: filtering to releases since #{timestamp_reference}\n")
+      if repository.last_release_date.nil? || repository.last_release_date < timestamp_reference
+        $stderr.puts("[#{repository.name}]: no new releases. skipping.")
         next
       end
-      versions = []
-      tags = tags.map {|tag| tag.name}
-                 .select {|tag| tag.match(/v\d+\.\d+\.\d+/) }
-                 .sort_by {|tag| Gem::Version.new(tag[1..-1]) }
-                 .reverse
-      tags = tags.slice(0,1) if latest_only?
-      tags.each do |tag|
-        version = tag[1..-1]
-        puts "[#{repo}] fetching docs for tag: #{tag} (version #{version}).."
-        doc = fetch_doc(repo, tag)
-        if doc.nil?
-          puts "[#{repo}] couldn't find docs for tag #{tag}, skipping remaining tags.."
-          break
-        else
-          begin
-            timestamp = parse_release_date(release_info, version)
-            date = timestamp.strftime("%Y-%m-%d")
-            versions << [tag, date]
-            expand_doc(doc, repo, tag, date)
-          rescue => e
-            puts "[#{repo}] failed to process release date for #{repo} #{tag}: #{e.inspect}"
-          end
+      $stderr.puts("[#{repository.name}]: found new releases (in total: #{repository.versioned_packages.size} releases)")
+
+      repository.versioned_packages.each do |versioned_package|
+        if versioned_package.integration?
+          expand_package_doc(versioned_package) && packages_to_reindex.add(versioned_package.name)
+        end
+
+        versioned_package.plugins.each do |plugin|
+          expand_plugin_doc(plugin) && plugins_to_reindex.add(plugin.canonical_name)
         end
       end
-      if versions.any?
-        _, _, name = repo.split("-",3)
-        write_versions_index(name, type, versions)
-        repos_to_index << name
-      end
     end
-    write_type_index(type, repos_to_index)
+
+    # rewrite incomplete plugin indices
+    $stderr.puts("REINDEXING PLUGINS... #{plugins_to_reindex.size}\n")
+    plugins_to_reindex.each do |canonical_name|
+      $stderr.puts("[#{canonical_name}] reindexing\n")
+      versions = plugin_version_index.for(canonical_name).sort_by(&:version).reverse.map do |plugin|
+        [plugin.tag, plugin.release_date.strftime("%Y-%m-%d")]
+      end
+      _, type, name = canonical_name.split('-',3)
+      write_versions_index(name, type, versions)
+    end
+
+    # rewrite versions-by-type indices
+    $stderr.puts("REINDEXING TYPES... #{}\n")
+    plugin_names_by_type.each do |type, names|
+      $stderr.puts("[#{type}] reindexing\n")
+      write_type_index(type, names.to_a)
+    end
   end
 
   def clone_docs_repo
@@ -208,38 +210,61 @@ class VersionedPluginDocs < Clamp::Command
     $?.exitstatus
   end
 
-  def fetch_doc(repo, tag)
-    response = Net::HTTP.get(URI.parse("https://raw.githubusercontent.com/logstash-plugins/#{repo}/#{tag}/docs/index.asciidoc"))
-    if response =~ /404: Not Found/
-      nil
-    else
-      response
-    end
-  end
+  ##
+  # Expands and persists docs for the given `VersionedPlugin`, refusing to overwrite if `--skip-existing`.
+  # Writes description of plugin with release date to STDOUT on success (e.g., "logstash-filter-mutate@v1.2.3 2017-02-28\n")
+  #
+  # @param plugin [VersionedPlugin]
+  # @return [Boolean]: returns `true` IFF docs were written
+  def expand_plugin_doc(plugin)
+    release_tag = plugin.tag
+    release_date = plugin.release_date ? plugin.release_date.strftime("%Y-%m-%d") : "unreleased"
+    changelog_url = plugin.changelog_url
 
-  def expand_doc(doc, repository, version, date)
-    _, type, name = repository.split("-",3)
-    output_asciidoc = "#{logstash_docs_path}/docs/versioned-plugins/#{type}s/#{name}-#{version}.asciidoc"
+    output_asciidoc = "#{logstash_docs_path}/docs/versioned-plugins/#{plugin.type}s/#{plugin.name}-#{release_tag}.asciidoc"
     if File.exists?(output_asciidoc) && skip_existing?
-      puts "skipping plugin #{repository} docs for version #{version}: file already exists"
-      return
+      $stderr.puts "[#{plugin.desc}]: skipping - file already exists\n"
+      return false
     end
+
+    $stderr.puts "[#{plugin.desc}]: fetching documentation\n"
+    content = plugin.documentation
+
+    if content.nil?
+      $stderr.puts("[#{plugin.desc}]: skipping - doc not found")
+      return false
+    end
+
+    content = extract_doc(content, plugin.canonical_name, release_tag, release_date, changelog_url)
 
     directory = File.dirname(output_asciidoc)
     FileUtils.mkdir_p(directory) if !File.directory?(directory)
+    File.write(output_asciidoc, content)
+    puts "#{plugin.desc}: #{release_date}"
+    true
+  end
+
+  def expand_package_doc(package)
+    # TODO: expand package-specific doc
+  end
+
+  def extract_doc(doc, plugin_full_name, release_tag, release_date, changelog_url)
+    _, type, name = plugin_full_name.split("-",3)
+    # documenting what variables are used below this point
+    # version: string, v-prefixed
+    # date: string release date as YYYY-MM-DD
+    # type: string e.g., from /\Alogstash-(?<type>input|output|codec|filter)-(?<name>.*)\z/
+    # name: string e.g., from /\Alogstash-(?<type>input|output|codec|filter)-(?<name>.*)\z/
+    # changelog_url: dynamically created from repository and version
 
     # Replace %VERSION%, etc
     content = doc \
-      .gsub("%VERSION%", version) \
-      .gsub("%RELEASE_DATE%", date) \
-      .gsub("%CHANGELOG_URL%", "https://github.com/logstash-plugins/#{repository}/blob/#{version}/CHANGELOG.md") \
+      .gsub("%VERSION%", release_tag) \
+      .gsub("%RELEASE_DATE%", release_date) \
+      .gsub("%CHANGELOG_URL%", changelog_url) \
       .gsub(":include_path: ../../../../logstash/docs/include", ":include_path: ../include/6.x") \
 
-    content = content.sub(/^:type: .*/) do |type|
-      "#{type}"
-    end
-
-    content = content.sub(/^=== .+? #{type} plugin$/) do |header|
+    content = content.sub(/^=== .+? [Pp]lugin$/) do |header|
       "#{header} {version}"
     end
 
@@ -248,6 +273,7 @@ class VersionedPluginDocs < Clamp::Command
         .gsub("[source]", "[source,shell]")
         .gsub('[id="plugins-{type}-{plugin}', '[id="plugins-{type}s-{plugin}')
         .gsub(":include_path: ../../../logstash/docs/include", ":include_path: ../include/6.x")
+        .gsub(/[\t\r ]+$/,"")
 
       content = content
         .gsub("<<string,string>>", "{logstash-ref}/configuration-file-structure.html#string[string]")
@@ -306,47 +332,7 @@ class VersionedPluginDocs < Clamp::Command
       end
     end
 
-    File.write(output_asciidoc, content)
-    puts "#{repository} #{version} (@ #{date})"
-    true
-  end
-
-  def fetch_release_info(gem_name)
-    uri = URI("https://rubygems.org/api/v1/versions/#{gem_name}.json")
-    response = Stud::try(5.times) do
-      r = Net::HTTP.get_response(uri)
-      if r.kind_of?(Net::HTTPSuccess)
-        r
-      elsif r.kind_of?(Net::HTTPNotFound)
-        nil
-      else
-        raise "Fetch rubygems metadata #{uri} failed: #{r}"
-      end
-    end
-
-    body = response.body
-    
-    # HACK: One of out default plugins, the webhdfs, has a bad encoding in the
-    # gemspec which make our parser trip with this error:
-    #
-    # Encoding::UndefinedConversionError message: ""\xC3"" from ASCII-8BIT to
-    # UTF-8. We dont have much choice than to force utf-8.
-    body.encode(Encoding::UTF_8, :invalid => :replace, :undef => :replace)
-
-    data = JSON.parse(body)
-  end
-
-  def parse_release_date(data, version)
-    current_version = data.select { |v| v["number"] == version }.first
-    if current_version.nil?
-      "N/A"
-    else
-      Time.parse(current_version["created_at"])
-    end
-  end
-
-  def versions_index_exists?(name, type)
-    File.exist?("#{logstash_docs_path}/docs/versioned-plugins/#{type}s/#{name}-index.asciidoc")
+    content
   end
 
   def write_versions_index(name, type, versions)

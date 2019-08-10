@@ -5,6 +5,7 @@ require "time"
 require "yaml"
 require "net/http"
 require "stud/try"
+require "peach"
 
 class PluginDocs < Clamp::Command
   option "--output-path", "OUTPUT", "Path to the top-level of the logstash-docs path to write the output.", required: true
@@ -12,94 +13,92 @@ class PluginDocs < Clamp::Command
   option "--settings", "SETTINGS_YAML", "Path to the settings file.", :default => File.join(File.dirname(__FILE__), "settings.yml"), :attribute_name => :settings_path
   parameter "PLUGINS_JSON", "The path to the file containing plugin versions json"
 
-  def settings
-    @settings ||= YAML.load(File.read(settings_path))
-  end
-
   def execute
+    context = DocGen::Context.new
+    settings = YAML.load(File.read(settings_path))
+
     report = JSON.parse(File.read(plugins_json))
-    plugins = report["successful"]
+    repositories = report["successful"]
 
-
-    plugins.each do |repository, details|
-      if settings["skip"].include?(repository)
-        puts "Skipping #{repository}"
+    repositories.each do |repository_name, details|
+      if settings['skip'].include?(repository_name)
+        $stderr.puts("Skipping #{repository_name}\n")
         next
       end
 
       is_default_plugin = details["from"] == "default"
-      if master?
-        version = "master"
-        date = "unreleased"
-      else
-        version = "v" + details["version"]
-        timestamp = release_date(repository, details["version"])
-        date = timestamp.strftime("%Y-%m-%d")
+      version = master? ? nil : details['version']
+
+      repository = Repository.from_rubygems(repository_name) do |gemdata|
+        github_source_from_gem_data(gemdata)
+      end
+      versioned_package = repository.versioned_package(version)
+
+      release_tag = versioned_package.tag
+      release_date = versioned_package.release_date.strftime("%Y-%m-%d")
+      changelog_url = versioned_package.changelog_url
+
+      versioned_package.plugins.each do |plugin|
+        $stderr.puts("[#{plugin.desc}]: fetching documentation\n")
+        content = plugin.documentation
+
+        output_asciidoc = "#{output_path}/docs/plugins/#{plugin.type}s/#{plugin.name}.asciidoc"
+        directory = File.dirname(output_asciidoc)
+        FileUtils.mkdir_p(directory) if !File.directory?(directory)
+
+        # Replace %VERSION%, etc
+        content = content \
+        .gsub("%VERSION%", release_tag) \
+        .gsub("%RELEASE_DATE%", release_date || "unreleased") \
+        .gsub("%CHANGELOG_URL%", changelog_url)
+
+        # Inject contextual variables for docs build
+        injection_variables = Hash.new
+        injection_variables[:default_plugin] = (is_default_plugin ? 1 : 0)
+        content = inject_variables(content, injection_variables)
+
+        # write the doc
+        File.write(output_asciidoc, content)
+        puts "#{plugin.desc}: #{release_date}\n"
       end
 
-      asciidoc_url = "https://raw.githubusercontent.com/logstash-plugins/#{repository}/#{version}/docs/index.asciidoc"
-
-      uri = URI(asciidoc_url)
-      response = Net::HTTP.get_response(uri)
-
-      if !response.kind_of?(Net::HTTPSuccess)
-        puts "Fetch of #{asciidoc_url} failed: #{response}"
-        next
+      if versioned_package.integration?
+        # TODO: generate package-level docs
       end
-
-      _, type, name = repository.split("-",3)
-      output_asciidoc = "#{output_path}/docs/plugins/#{type}s/#{name}.asciidoc"
-      directory = File.dirname(output_asciidoc)
-      FileUtils.mkdir_p(directory) if !File.directory?(directory)
-
-      # Replace %VERSION%, etc
-      content = response.body \
-        .gsub("%VERSION%", version) \
-        .gsub("%RELEASE_DATE%", date) \
-        .gsub("%CHANGELOG_URL%", "https://github.com/logstash-plugins/#{repository}/blob/#{version}/CHANGELOG.md")
-
-      content = content.sub(/^:type: .*/) do |type|
-        # Mark default/non-default plugins so that the docs build will know to add the
-        # "how to install this plugin" banner.
-        if is_default_plugin
-          "#{type}\n:default_plugin: 1"
-        else
-          "#{type}\n:default_plugin: 0"
-        end
-      end
-
-      File.write(output_asciidoc, content)
-      puts "#{repository} #{version} (@ #{date})"
     end
   end
 
-  def release_date(gem_name, version)
-    uri = URI("https://rubygems.org/api/v1/versions/#{gem_name}.json")
-    response = Stud::try(5.times) do
-      r = Net::HTTP.get_response(uri)
-      if !r.kind_of?(Net::HTTPSuccess)
-        raise "Fetch rubygems metadata #{uri} failed: #{r}"
-      end
-      r
+  private
+
+  ##
+  # Hack to inject variables after a known pattern (the type declaration)
+  #
+  # @param content [String]
+  # @param kv [Hash{#to_s,#to_s}]
+  # @return [String]
+  def inject_variables(content, kv)
+    kv_string = kv.map do |k, v|
+      ":#{k}: #{v}"
+    end.join("\n")
+
+    content.sub(/^:type: .*/) do |type|
+      "#{type}\n:#{kv_string}"
     end
+  end
 
-    body = response.body
-    
-    # HACK: One of out default plugins, the webhdfs, has a bad encoding in the
-    # gemspec which make our parser trip with this error:
-    #
-    # Encoding::UndefinedConversionError message: ""\xC3"" from ASCII-8BIT to
-    # UTF-8. We dont have much choice than to force utf-8.
-    body.encode(Encoding::UTF_8, :invalid => :replace, :undef => :replace)
+  def github_source_from_gem_data(gem_data)
+    known_source = gem_info.dig('source_code_uri')
 
-    data = JSON.parse(body)
-
-    current_version = data.select { |v| v["number"] == version }.first
-    if current_version.nil?
-      "N/A"
+    if known_source
+      known_source =~ %r{\bgithub\.com/(?<org>[^/])/(?<repo>[^/])} || fail("unsupported source `#{source}`")
+      org = Regexp.last_match(:org)
+      repo = Regexp.last_match(:repo)
     else
-      Time.parse(current_version["created_at"])
+      org = ENV.fetch('PLUGIN_ORG','logstash-plugins')
+      repo = gem_name
     end
+
+    Source::Github.new(org, repo)
   end
 end
 
