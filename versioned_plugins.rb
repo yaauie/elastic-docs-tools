@@ -131,32 +131,31 @@ class VersionedPluginDocs < Clamp::Command
     repositories.peach(parallelism) do |repository|
       latest_release = repository.last_release
       if latest_release.nil?
-        $stderr.puts("[repo:#{repository.desc}]: no releases on rubygems.\n")
+        $stderr.puts("#{repository.desc}: no releases on rubygems.\n")
         next
       end
 
       # if the repository has no releases, or none since our `timestamp_reference`,
       # it doesn't need to be added to the reindex list here.
       if latest_release.release_date.nil? || latest_release.release_date < timestamp_reference
-        $stderr.puts("[repo:#{repository.name}]: no new releases.\n")
+        $stderr.puts("#{repository.desc}: no new releases.\n")
         next
       end
 
       # the repository has one or more releases since our `timestamp_reference`, which means
       # it will need to be reindexed.
-      $stderr.puts("[repo:#{repository.name}]: found new release\n")
-      repos_requiring_rebuild.add(repository.name) &&
-          $stderr.puts("[repo:#{repository.name}]: marked for reindex\n")
+      $stderr.puts("#{repository.desc}: found new release\n")
+      # repos_requiring_rebuild.add(repository.name) &&
+          # $stderr.puts("[repo:#{repository.name}]: marked for reindex\n")
 
       # if the latest release is an integration plugin, each of the plugins it contains
       # may have previously been sourced in a different repository; add the plugin name
       # to the list of repositories requiring reindexing.
-      if latest_release.integration?
-        latest_release.plugins.each do |plugin|
-          repos_requiring_rebuild.add(plugin.canonical_name) &&
-              $stderr.puts("[plugin:#{plugin.canonical_name}]: marking for reindex\n")
-        end
+      latest_release.each do |plugin|
+        repos_requiring_rebuild.add(plugin.canonical_name) &&
+            $stderr.puts("#{plugin.desc}: marking for reindex\n")
       end
+
     end
 
     # Now that we know which repositories require reindexing, we can start the work.
@@ -164,7 +163,7 @@ class VersionedPluginDocs < Clamp::Command
       unless repos_requiring_rebuild.include?(repository.name)
         $stderr.puts("[repo:#{repository.name}]: rebuild not required. skipping.\n")
         latest_release = repository.last_release
-        latest_release && latest_release.plugins.each do |plugin|
+        latest_release && latest_release.each do |plugin|
           next unless versions_index_exists?(plugin.name, plugin.type)
           plugin_names_by_type.fetch(plugin.type).add(plugin.name)
         end
@@ -172,22 +171,18 @@ class VersionedPluginDocs < Clamp::Command
       end
 
       $stderr.puts("[repo:#{repository.name}]: rebuilding versioned docs\n")
-      repository.source_tagged_releases.each do |released_package|
-        released_package.plugins.each do |plugin|
-          if expand_plugin_doc(plugin)
-            plugins_indexes_to_rebuild.add(plugin.canonical_name)
-            plugin_version_index.fetch(plugin.canonical_name).add(plugin)
-            plugin_names_by_type.fetch(plugin.type).add(plugin.name)
+      repository.source_tagged_releases.each do |released_plugin|
+        released_plugin.each do |inner_plugin|
+          if expand_plugin_doc(inner_plugin)
+            plugins_indexes_to_rebuild.add(inner_plugin.canonical_name)
+            plugin_version_index.fetch(inner_plugin.canonical_name).add(inner_plugin)
+            plugin_names_by_type.fetch(inner_plugin.type).add(inner_plugin.name)
           else
-            $stderr.puts("[plugin:#{plugin.desc}]: documentation not available; skipping remaining releases from repository\n")
+            $stderr.puts("#{inner_plugin.desc}: documentation not available; skipping remaining releases from repository\n")
             break false
           end
         end || break
-        if released_package.integration?
-          if expand_package_doc(released_package)
-            package_indexes_to_rebuild.add(repository.name)
-          end
-        end
+
         break if latest_only?
       end
     end
@@ -281,11 +276,11 @@ class VersionedPluginDocs < Clamp::Command
       return true
     end
 
-    $stderr.puts "[#{plugin.desc}]: fetching documentation\n"
+    $stderr.puts "#{plugin.desc}: fetching documentation\n"
     content = plugin.documentation
 
     if content.nil?
-      $stderr.puts("[#{plugin.desc}]: doc not found\n")
+      $stderr.puts("#{plugin.desc}: doc not found\n")
       return false
     end
 

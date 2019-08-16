@@ -4,6 +4,7 @@ require_relative 'util/threadsafe_index'
 require_relative 'util/threadsafe_deferral'
 
 require_relative 'release_package'
+require_relative 'plugin'
 require_relative 'source'
 require_relative 'rubygem_info'
 
@@ -66,6 +67,7 @@ module LogstashDocket
       @source = source
 
       @package_versions = Util::ThreadsafeIndex.new { |version| ReleasePackage.new(self, version) }
+      @plugin_versions = Util::ThreadsafeIndex.new { |version| Plugin::TopLevel.new(repository: self, version: version) }
 
       @rubygem_info = Util::ThreadsafeDeferral.for { rubygem_info || RubygemInfo.new(name) }
     end
@@ -73,7 +75,7 @@ module LogstashDocket
     ##
     # @return [String]: a short description suitable for logging
     def desc
-      @name
+      @desc ||= "[repository:#{name}]"
     end
 
     ##
@@ -84,11 +86,25 @@ module LogstashDocket
     def source_tagged_releases(include_prerelease=false)
       return enum_for(:source_tagged_releases, include_prerelease) unless block_given?
 
-      released_packages(include_prerelease).each do |released_package|
-        next unless source.release_tags.include?(released_package.tag)
+      released_plugins(include_prerelease).each do |released_plugin|
+        next unless source.release_tags.include?(released_plugin.tag)
 
-        yield released_package
+        yield released_plugin
       end
+    end
+
+    def released_plugins(include_prerelease=false)
+      return enum_for(:released_plugins, include_prerelease) unless block_given?
+
+      rubygem_info.versions.each do |version|
+        next unless include_prerelease || !Gem::Version.new(version).prerelease?
+
+        yield released_plugin(version)
+      end
+    end
+
+    def released_plugin(version)
+      @plugin_versions.fetch(version)
     end
 
     ##
@@ -128,7 +144,7 @@ module LogstashDocket
     def last_release
       latest_version = rubygem_info.latest
 
-      latest_version && released_package(latest_version)
+      latest_version && released_plugin(latest_version)
     end
 
     ##

@@ -34,26 +34,26 @@ class PluginDocs < Clamp::Command
       is_default_plugin = details["from"] == "default"
       version = master? ? nil : details['version']
 
-      released_package = ReleasePackage.from_rubygems(repository_name, version) do |gem_data|
+      released_plugin = Plugin.from_rubygems(repository_name, version) do |gem_data|
         github_source_from_gem_data(repository_name, gem_data)
-      end || fail("[package:#{repository_name}@#{tag(version)}]: failed to find release package via rubygems")
+      end || fail("[repository:#{repository_name}]: failed to find release package `#{tag(version)}` via rubygems")
 
-      release_tag = released_package.tag
-      release_date = released_package.release_date ?
-                         released_package.release_date.strftime("%Y-%m-%d") :
+      release_tag = released_plugin.tag
+      release_date = released_plugin.release_date ?
+                         released_plugin.release_date.strftime("%Y-%m-%d") :
                          "unreleased"
-      changelog_url = released_package.changelog_url
+      changelog_url = released_plugin.changelog_url
 
-      released_package.plugins.each do |plugin|
-        $stderr.puts("[plugin:#{plugin.desc}]: fetching documentation\n")
-        content = plugin.documentation
+      released_plugin.each do |inner_plugin|
+        $stderr.puts("#{inner_plugin.desc}: fetching documentation\n")
+        content = inner_plugin.documentation
 
         if content.nil?
-          $stderr.puts("[plugin:#{plugin.desc}]: failed to fetch doc; skipping\n")
+          $stderr.puts("#{inner_plugin.desc}: failed to fetch doc; skipping\n")
           next
         end
 
-        output_asciidoc = "#{output_path}/docs/plugins/#{plugin.type}s/#{plugin.name}.asciidoc"
+        output_asciidoc = "#{output_path}/docs/plugins/#{inner_plugin.type}s/#{inner_plugin.name}.asciidoc"
         directory = File.dirname(output_asciidoc)
         FileUtils.mkdir_p(directory) if !File.directory?(directory)
 
@@ -70,11 +70,7 @@ class PluginDocs < Clamp::Command
 
         # write the doc
         File.write(output_asciidoc, content)
-        puts "#{plugin.desc}: #{release_date}\n"
-      end
-
-      if released_package.integration?
-        # TODO: generate package-level docs
+        puts "#{inner_plugin.canonical_name}@#{inner_plugin.tag}: #{release_date}\n"
       end
     end
   end
@@ -101,6 +97,9 @@ class PluginDocs < Clamp::Command
   # Support for plugins that are sourced outside the logstash-plugins org,
   # by means of the gem_data's `source_code_uri` metadata.
   def github_source_from_gem_data(gem_name, gem_data)
+    if gem_name == "logstash-integration-rabbitmq"
+      return Source::Github.new(org: "yaauie", repo: gem_name)
+    end
     known_source = gem_data.dig('source_code_uri')
 
     if known_source
